@@ -2,7 +2,7 @@
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime::task::{self, JoinHandle, LocalOwnedTasks, Task};
 use crate::sync::AtomicWaker;
-use crate::util::VecDequeCell;
+use crate::util::{RcCell, VecDequeCell};
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -10,6 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::Poll;
 
 use pin_project_lite::pin_project;
@@ -159,7 +160,7 @@ cfg_rt! {
     ///                     tokio::task::spawn_local(run_task(new_task));
     ///                 }
     ///                 // If the while loop returns, then all the LocalSpawner
-    ///                 // objects have have been dropped.
+    ///                 // objects have been dropped.
     ///             });
     ///
     ///             // This will return once all senders are dropped and all
@@ -215,7 +216,7 @@ cfg_rt! {
         tick: Cell<u8>,
 
         /// State available from thread-local.
-        context: Context,
+        context: Rc<Context>,
 
         /// This type should not be Send.
         _not_send: PhantomData<*const ()>,
@@ -232,6 +233,10 @@ struct Context {
 
     /// State shared between threads.
     shared: Arc<Shared>,
+
+    /// True if a task panicked without being handled and the local set is
+    /// configured to shutdown on unhandled panic.
+    unhandled_panic: Cell<bool>,
 }
 
 /// LocalSet state shared between threads.
@@ -241,6 +246,10 @@ struct Shared {
 
     /// Wake the `LocalSet` task.
     waker: AtomicWaker,
+
+    /// How to respond to unhandled task panics.
+    #[cfg(tokio_unstable)]
+    pub(crate) unhandled_panic: crate::runtime::UnhandledPanic,
 }
 
 pin_project! {
@@ -252,7 +261,11 @@ pin_project! {
     }
 }
 
-scoped_thread_local!(static CURRENT: Context);
+#[cfg(any(loom, tokio_no_const_thread_local))]
+thread_local!(static CURRENT: RcCell<Context> = RcCell::new());
+
+#[cfg(not(any(loom, tokio_no_const_thread_local)))]
+thread_local!(static CURRENT: RcCell<Context> = const { RcCell::new() });
 
 cfg_rt! {
     /// Spawns a `!Send` future on the local task set.
@@ -302,10 +315,10 @@ cfg_rt! {
           F::Output: 'static
     {
         CURRENT.with(|maybe_cx| {
-            let cx = maybe_cx
-                .expect("`spawn_local` called from outside of a `task::LocalSet`");
-
-            cx.spawn(future, name)
+            match maybe_cx.get() {
+                None => panic!("`spawn_local` called from outside of a `task::LocalSet`"),
+                Some(cx) => cx.spawn(future, name)
+            }
         })
     }
 }
@@ -319,21 +332,54 @@ const MAX_TASKS_PER_TICK: usize = 61;
 /// How often it check the remote queue first.
 const REMOTE_FIRST_INTERVAL: u8 = 31;
 
+/// Context guard for LocalSet
+pub struct LocalEnterGuard(Option<Rc<Context>>);
+
+impl Drop for LocalEnterGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|ctx| {
+            ctx.set(self.0.take());
+        })
+    }
+}
+
+impl fmt::Debug for LocalEnterGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalEnterGuard").finish()
+    }
+}
+
 impl LocalSet {
     /// Returns a new local task set.
     pub fn new() -> LocalSet {
         LocalSet {
             tick: Cell::new(0),
-            context: Context {
+            context: Rc::new(Context {
                 owned: LocalOwnedTasks::new(),
                 queue: VecDequeCell::with_capacity(INITIAL_CAPACITY),
                 shared: Arc::new(Shared {
                     queue: Mutex::new(Some(VecDeque::with_capacity(INITIAL_CAPACITY))),
                     waker: AtomicWaker::new(),
+                    #[cfg(tokio_unstable)]
+                    unhandled_panic: crate::runtime::UnhandledPanic::Ignore,
                 }),
-            },
+                unhandled_panic: Cell::new(false),
+            }),
             _not_send: PhantomData,
         }
+    }
+
+    /// Enters the context of this `LocalSet`.
+    ///
+    /// The [`spawn_local`] method will spawn tasks on the `LocalSet` whose
+    /// context you are inside.
+    ///
+    /// [`spawn_local`]: fn@crate::task::spawn_local
+    pub fn enter(&self) -> LocalEnterGuard {
+        CURRENT.with(|ctx| {
+            let old = ctx.replace(Some(self.context.clone()));
+            LocalEnterGuard(old)
+        })
     }
 
     /// Spawns a `!Send` task onto the local task set.
@@ -443,6 +489,7 @@ impl LocalSet {
     /// [`Runtime::block_on`]: method@crate::runtime::Runtime::block_on
     /// [in-place blocking]: fn@crate::task::block_in_place
     /// [`spawn_blocking`]: fn@crate::task::spawn_blocking
+    #[track_caller]
     #[cfg(feature = "rt")]
     #[cfg_attr(docsrs, doc(cfg(feature = "rt")))]
     pub fn block_on<F>(&self, rt: &crate::runtime::Runtime, future: F) -> F::Output
@@ -516,6 +563,11 @@ impl LocalSet {
     /// notified again.
     fn tick(&self) -> bool {
         for _ in 0..MAX_TASKS_PER_TICK {
+            // Make sure we didn't hit an unhandled panic
+            if self.context.unhandled_panic.get() {
+                panic!("a spawned task panicked and the LocalSet is configured to shutdown on unhandled panic");
+            }
+
             match self.next_task() {
                 // Run the task
                 //
@@ -563,7 +615,96 @@ impl LocalSet {
     }
 
     fn with<T>(&self, f: impl FnOnce() -> T) -> T {
-        CURRENT.set(&self.context, f)
+        CURRENT.with(|ctx| {
+            struct Reset<'a> {
+                ctx_ref: &'a RcCell<Context>,
+                val: Option<Rc<Context>>,
+            }
+            impl<'a> Drop for Reset<'a> {
+                fn drop(&mut self) {
+                    self.ctx_ref.set(self.val.take());
+                }
+            }
+            let old = ctx.replace(Some(self.context.clone()));
+
+            let _reset = Reset {
+                ctx_ref: ctx,
+                val: old,
+            };
+
+            f()
+        })
+    }
+}
+
+cfg_unstable! {
+    impl LocalSet {
+        /// Configure how the `LocalSet` responds to an unhandled panic on a
+        /// spawned task.
+        ///
+        /// By default, an unhandled panic (i.e. a panic not caught by
+        /// [`std::panic::catch_unwind`]) has no impact on the `LocalSet`'s
+        /// execution. The panic is error value is forwarded to the task's
+        /// [`JoinHandle`] and all other spawned tasks continue running.
+        ///
+        /// The `unhandled_panic` option enables configuring this behavior.
+        ///
+        /// * `UnhandledPanic::Ignore` is the default behavior. Panics on
+        ///   spawned tasks have no impact on the `LocalSet`'s execution.
+        /// * `UnhandledPanic::ShutdownRuntime` will force the `LocalSet` to
+        ///   shutdown immediately when a spawned task panics even if that
+        ///   task's `JoinHandle` has not been dropped. All other spawned tasks
+        ///   will immediately terminate and further calls to
+        ///   [`LocalSet::block_on`] and [`LocalSet::run_until`] will panic.
+        ///
+        /// # Panics
+        ///
+        /// This method panics if called after the `LocalSet` has started
+        /// running.
+        ///
+        /// # Unstable
+        ///
+        /// This option is currently unstable and its implementation is
+        /// incomplete. The API may change or be removed in the future. See
+        /// tokio-rs/tokio#4516 for more details.
+        ///
+        /// # Examples
+        ///
+        /// The following demonstrates a `LocalSet` configured to shutdown on
+        /// panic. The first spawned task panics and results in the `LocalSet`
+        /// shutting down. The second spawned task never has a chance to
+        /// execute. The call to `run_until` will panic due to the runtime being
+        /// forcibly shutdown.
+        ///
+        /// ```should_panic
+        /// use tokio::runtime::UnhandledPanic;
+        ///
+        /// # #[tokio::main]
+        /// # async fn main() {
+        /// tokio::task::LocalSet::new()
+        ///     .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+        ///     .run_until(async {
+        ///         tokio::task::spawn_local(async { panic!("boom"); });
+        ///         tokio::task::spawn_local(async {
+        ///             // This task never completes
+        ///         });
+        ///
+        ///         // Do some work, but `run_until` will panic before it completes
+        /// # loop { tokio::task::yield_now().await; }
+        ///     })
+        ///     .await;
+        /// # }
+        /// ```
+        ///
+        /// [`JoinHandle`]: struct@crate::task::JoinHandle
+        pub fn unhandled_panic(&mut self, behavior: crate::runtime::UnhandledPanic) -> &mut Self {
+            // TODO: This should be set as a builder
+            Rc::get_mut(&mut self.context)
+                .and_then(|ctx| Arc::get_mut(&mut ctx.shared))
+                .expect("Unhandled Panic behavior modified after starting LocalSet")
+                .unhandled_panic = behavior;
+            self
+        }
     }
 }
 
@@ -686,20 +827,22 @@ impl<T: Future> Future for RunUntil<'_, T> {
 impl Shared {
     /// Schedule the provided task on the scheduler.
     fn schedule(&self, task: task::Notified<Arc<Self>>) {
-        CURRENT.with(|maybe_cx| match maybe_cx {
-            Some(cx) if cx.shared.ptr_eq(self) => {
-                cx.queue.push_back(task);
-            }
-            _ => {
-                // First check whether the queue is still there (if not, the
-                // LocalSet is dropped). Then push to it if so, and if not,
-                // do nothing.
-                let mut lock = self.queue.lock();
+        CURRENT.with(|maybe_cx| {
+            match maybe_cx.get() {
+                Some(cx) if cx.shared.ptr_eq(self) => {
+                    cx.queue.push_back(task);
+                }
+                _ => {
+                    // First check whether the queue is still there (if not, the
+                    // LocalSet is dropped). Then push to it if so, and if not,
+                    // do nothing.
+                    let mut lock = self.queue.lock();
 
-                if let Some(queue) = lock.as_mut() {
-                    queue.push_back(task);
-                    drop(lock);
-                    self.waker.wake();
+                    if let Some(queue) = lock.as_mut() {
+                        queue.push_back(task);
+                        drop(lock);
+                        self.waker.wake();
+                    }
                 }
             }
         });
@@ -712,14 +855,40 @@ impl Shared {
 
 impl task::Schedule for Arc<Shared> {
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
-        CURRENT.with(|maybe_cx| {
-            let cx = maybe_cx.expect("scheduler context missing");
-            assert!(cx.shared.ptr_eq(self));
-            cx.owned.remove(task)
+        CURRENT.with(|maybe_cx| match maybe_cx.get() {
+            None => panic!("scheduler context missing"),
+            Some(cx) => {
+                assert!(cx.shared.ptr_eq(self));
+                cx.owned.remove(task)
+            }
         })
     }
 
     fn schedule(&self, task: task::Notified<Self>) {
         Shared::schedule(self, task);
+    }
+
+    cfg_unstable! {
+        fn unhandled_panic(&self) {
+            use crate::runtime::UnhandledPanic;
+
+            match self.unhandled_panic {
+                UnhandledPanic::Ignore => {
+                    // Do nothing
+                }
+                UnhandledPanic::ShutdownRuntime => {
+                    // This hook is only called from within the runtime, so
+                    // `CURRENT` should match with `&self`, i.e. there is no
+                    // opportunity for a nested scheduler to be called.
+                    CURRENT.with(|maybe_cx| match maybe_cx.get() {
+                        Some(cx) if Arc::ptr_eq(self, &cx.shared) => {
+                            cx.unhandled_panic.set(true);
+                            cx.owned.close_and_shutdown_all();
+                        }
+                        _ => unreachable!("runtime core not set in CURRENT thread-local"),
+                    })
+                }
+            }
+        }
     }
 }

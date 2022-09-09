@@ -20,15 +20,15 @@
 //! use tokio::sync::watch;
 //!
 //! # async fn dox() -> Result<(), Box<dyn std::error::Error>> {
-//!     let (tx, mut rx) = watch::channel("hello");
+//! let (tx, mut rx) = watch::channel("hello");
 //!
-//!     tokio::spawn(async move {
-//!         while rx.changed().await.is_ok() {
-//!             println!("received = {:?}", *rx.borrow());
-//!         }
-//!     });
+//! tokio::spawn(async move {
+//!     while rx.changed().await.is_ok() {
+//!         println!("received = {:?}", *rx.borrow());
+//!     }
+//! });
 //!
-//!     tx.send("world")?;
+//! tx.send("world")?;
 //! # Ok(())
 //! # }
 //! ```
@@ -91,7 +91,9 @@ pub struct Sender<T> {
 ///
 /// Outstanding borrows hold a read lock on the inner value. This means that
 /// long lived borrows could cause the produce half to block. It is recommended
-/// to keep the borrow as short lived as possible.
+/// to keep the borrow as short lived as possible. Additionally, if you are
+/// running in an environment that allows `!Send` futures, you must ensure that
+/// the returned `Ref` type is never held alive across an `.await` point.
 ///
 /// The priority policy of the lock is dependent on the underlying lock
 /// implementation, and this type does not guarantee that any particular policy
@@ -112,6 +114,55 @@ pub struct Sender<T> {
 #[derive(Debug)]
 pub struct Ref<'a, T> {
     inner: RwLockReadGuard<'a, T>,
+    has_changed: bool,
+}
+
+impl<'a, T> Ref<'a, T> {
+    /// Indicates if the borrowed value is considered as _changed_ since the last
+    /// time it has been marked as seen.
+    ///
+    /// Unlike [`Receiver::has_changed()`], this method does not fail if the channel is closed.
+    ///
+    /// When borrowed from the [`Sender`] this function will always return `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tokio::sync::watch;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let (tx, mut rx) = watch::channel("hello");
+    ///
+    ///     tx.send("goodbye").unwrap();
+    ///     // The sender does never consider the value as changed.
+    ///     assert!(!tx.borrow().has_changed());
+    ///
+    ///     // Drop the sender immediately, just for testing purposes.
+    ///     drop(tx);
+    ///
+    ///     // Even if the sender has already been dropped...
+    ///     assert!(rx.has_changed().is_err());
+    ///     // ...the modified value is still readable and detected as changed.
+    ///     assert_eq!(*rx.borrow(), "goodbye");
+    ///     assert!(rx.borrow().has_changed());
+    ///
+    ///     // Read the changed value and mark it as seen.
+    ///     {
+    ///         let received = rx.borrow_and_update();
+    ///         assert_eq!(*received, "goodbye");
+    ///         assert!(received.has_changed());
+    ///         // Release the read lock when leaving this scope.
+    ///     }
+    ///
+    ///     // Now the value has already been marked as seen and could
+    ///     // never be modified again (after the sender has been dropped).
+    ///     assert!(!rx.borrow().has_changed());
+    /// }
+    /// ```
+    pub fn has_changed(&self) -> bool {
+        self.has_changed
+    }
 }
 
 #[derive(Debug)]
@@ -301,7 +352,9 @@ impl<T> Receiver<T> {
     ///
     /// Outstanding borrows hold a read lock. This means that long lived borrows
     /// could cause the send half to block. It is recommended to keep the borrow
-    /// as short lived as possible.
+    /// as short lived as possible. Additionally, if you are running in an
+    /// environment that allows `!Send` futures, you must ensure that the
+    /// returned `Ref` type is never held alive across an `.await` point.
     ///
     /// The priority policy of the lock is dependent on the underlying lock
     /// implementation, and this type does not guarantee that any particular policy
@@ -332,19 +385,27 @@ impl<T> Receiver<T> {
     /// ```
     pub fn borrow(&self) -> Ref<'_, T> {
         let inner = self.shared.value.read().unwrap();
-        Ref { inner }
+
+        // After obtaining a read-lock no concurrent writes could occur
+        // and the loaded version matches that of the borrowed reference.
+        let new_version = self.shared.state.load().version();
+        let has_changed = self.version != new_version;
+
+        Ref { inner, has_changed }
     }
 
-    /// Returns a reference to the most recently sent value and mark that value
+    /// Returns a reference to the most recently sent value and marks that value
     /// as seen.
     ///
-    /// This method marks the value as seen, so [`changed`] will not return
-    /// immediately if the newest value is one previously returned by
-    /// `borrow_and_update`.
+    /// This method marks the current value as seen. Subsequent calls to [`changed`]
+    /// will not return immediately until the [`Sender`] has modified the shared
+    /// value again.
     ///
     /// Outstanding borrows hold a read lock. This means that long lived borrows
     /// could cause the send half to block. It is recommended to keep the borrow
-    /// as short lived as possible.
+    /// as short lived as possible. Additionally, if you are running in an
+    /// environment that allows `!Send` futures, you must ensure that the
+    /// returned `Ref` type is never held alive across an `.await` point.
     ///
     /// The priority policy of the lock is dependent on the underlying lock
     /// implementation, and this type does not guarantee that any particular policy
@@ -366,8 +427,16 @@ impl<T> Receiver<T> {
     /// [`changed`]: Receiver::changed
     pub fn borrow_and_update(&mut self) -> Ref<'_, T> {
         let inner = self.shared.value.read().unwrap();
-        self.version = self.shared.state.load().version();
-        Ref { inner }
+
+        // After obtaining a read-lock no concurrent writes could occur
+        // and the loaded version matches that of the borrowed reference.
+        let new_version = self.shared.state.load().version();
+        let has_changed = self.version != new_version;
+
+        // Mark the shared value as seen by updating the version
+        self.version = new_version;
+
+        Ref { inner, has_changed }
     }
 
     /// Checks if this channel contains a message that this receiver has not yet
@@ -535,8 +604,22 @@ impl<T> Drop for Receiver<T> {
 impl<T> Sender<T> {
     /// Sends a new value via the channel, notifying all receivers.
     ///
-    /// This method fails if the channel has been closed, which happens when
-    /// every receiver has been dropped.
+    /// This method fails if the channel is closed, which is the case when
+    /// every receiver has been dropped. It is possible to reopen the channel
+    /// using the [`subscribe`] method. However, when `send` fails, the value
+    /// isn't made available for future receivers (but returned with the
+    /// [`SendError`]).
+    ///
+    /// To always make a new value available for future receivers, even if no
+    /// receiver currently exists, one of the other send methods
+    /// ([`send_if_modified`], [`send_modify`], or [`send_replace`]) can be
+    /// used instead.
+    ///
+    /// [`subscribe`]: Sender::subscribe
+    /// [`SendError`]: error::SendError
+    /// [`send_if_modified`]: Sender::send_if_modified
+    /// [`send_modify`]: Sender::send_modify
+    /// [`send_replace`]: Sender::send_replace
     pub fn send(&self, value: T) -> Result<(), error::SendError<T>> {
         // This is pretty much only useful as a hint anyway, so synchronization isn't critical.
         if 0 == self.receiver_count() {
@@ -596,7 +679,7 @@ impl<T> Sender<T> {
     ///
     /// The `modify` closure must return `true` if the value has actually
     /// been modified during the mutable borrow. It should only return `false`
-    /// if the value is guaranteed to be unnmodified despite the mutable
+    /// if the value is guaranteed to be unmodified despite the mutable
     /// borrow.
     ///
     /// Receivers are only notified if the closure returned `true`. If the
@@ -725,7 +808,11 @@ impl<T> Sender<T> {
     /// ```
     pub fn borrow(&self) -> Ref<'_, T> {
         let inner = self.shared.value.read().unwrap();
-        Ref { inner }
+
+        // The sender/producer always sees the current version
+        let has_changed = false;
+
+        Ref { inner, has_changed }
     }
 
     /// Checks if the channel has been closed. This happens when all receivers

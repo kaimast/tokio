@@ -44,10 +44,8 @@ pub(crate) mod linked_list;
 mod rand;
 
 cfg_rt! {
-    cfg_unstable! {
-        mod idle_notified_set;
-        pub(crate) use idle_notified_set::IdleNotifiedSet;
-    }
+    mod idle_notified_set;
+    pub(crate) use idle_notified_set::IdleNotifiedSet;
 
     mod wake;
     pub(crate) use wake::WakerRef;
@@ -58,6 +56,9 @@ cfg_rt! {
 
     mod vec_deque_cell;
     pub(crate) use vec_deque_cell::VecDequeCell;
+
+    mod rc_cell;
+    pub(crate) use rc_cell::RcCell;
 }
 
 cfg_rt_multi_thread! {

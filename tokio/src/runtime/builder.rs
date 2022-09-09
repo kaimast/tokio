@@ -84,13 +84,102 @@ pub struct Builder {
 
     /// How many ticks before yielding to the driver for timer and I/O events?
     pub(super) event_interval: u32,
+
+    /// When true, the multi-threade scheduler LIFO slot should not be used.
+    ///
+    /// This option should only be exposed as unstable.
+    pub(super) disable_lifo_slot: bool,
+
+    #[cfg(tokio_unstable)]
+    pub(super) unhandled_panic: UnhandledPanic,
+}
+
+cfg_unstable! {
+    /// How the runtime should respond to unhandled panics.
+    ///
+    /// Instances of `UnhandledPanic` are passed to `Builder::unhandled_panic`
+    /// to configure the runtime behavior when a spawned task panics.
+    ///
+    /// See [`Builder::unhandled_panic`] for more details.
+    #[derive(Debug, Clone)]
+    #[non_exhaustive]
+    pub enum UnhandledPanic {
+        /// The runtime should ignore panics on spawned tasks.
+        ///
+        /// The panic is forwarded to the task's [`JoinHandle`] and all spawned
+        /// tasks continue running normally.
+        ///
+        /// This is the default behavior.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime::{self, UnhandledPanic};
+        ///
+        /// # pub fn main() {
+        /// let rt = runtime::Builder::new_current_thread()
+        ///     .unhandled_panic(UnhandledPanic::Ignore)
+        ///     .build()
+        ///     .unwrap();
+        ///
+        /// let task1 = rt.spawn(async { panic!("boom"); });
+        /// let task2 = rt.spawn(async {
+        ///     // This task completes normally
+        ///     "done"
+        /// });
+        ///
+        /// rt.block_on(async {
+        ///     // The panic on the first task is forwarded to the `JoinHandle`
+        ///     assert!(task1.await.is_err());
+        ///
+        ///     // The second task completes normally
+        ///     assert!(task2.await.is_ok());
+        /// })
+        /// # }
+        /// ```
+        ///
+        /// [`JoinHandle`]: struct@crate::task::JoinHandle
+        Ignore,
+
+        /// The runtime should immediately shutdown if a spawned task panics.
+        ///
+        /// The runtime will immediately shutdown even if the panicked task's
+        /// [`JoinHandle`] is still available. All further spawned tasks will be
+        /// immediately dropped and call to [`Runtime::block_on`] will panic.
+        ///
+        /// # Examples
+        ///
+        /// ```should_panic
+        /// use tokio::runtime::{self, UnhandledPanic};
+        ///
+        /// # pub fn main() {
+        /// let rt = runtime::Builder::new_current_thread()
+        ///     .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+        ///     .build()
+        ///     .unwrap();
+        ///
+        /// rt.spawn(async { panic!("boom"); });
+        /// rt.spawn(async {
+        ///     // This task never completes.
+        /// });
+        ///
+        /// rt.block_on(async {
+        ///     // Do some work
+        /// # loop { tokio::task::yield_now().await; }
+        /// })
+        /// # }
+        /// ```
+        ///
+        /// [`JoinHandle`]: struct@crate::task::JoinHandle
+        ShutdownRuntime,
+    }
 }
 
 pub(crate) type ThreadNameFn = std::sync::Arc<dyn Fn() -> String + Send + Sync + 'static>;
 
 pub(crate) enum Kind {
     CurrentThread,
-    #[cfg(feature = "rt-multi-thread")]
+    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
     MultiThread,
 }
 
@@ -113,14 +202,16 @@ impl Builder {
         Builder::new(Kind::CurrentThread, 31, EVENT_INTERVAL)
     }
 
-    /// Returns a new builder with the multi thread scheduler selected.
-    ///
-    /// Configuration methods can be chained on the return value.
-    #[cfg(feature = "rt-multi-thread")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
-    pub fn new_multi_thread() -> Builder {
-        // The number `61` is fairly arbitrary. I believe this value was copied from golang.
-        Builder::new(Kind::MultiThread, 61, 61)
+    cfg_not_wasi! {
+        /// Returns a new builder with the multi thread scheduler selected.
+        ///
+        /// Configuration methods can be chained on the return value.
+        #[cfg(feature = "rt-multi-thread")]
+        #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+        pub fn new_multi_thread() -> Builder {
+            // The number `61` is fairly arbitrary. I believe this value was copied from golang.
+            Builder::new(Kind::MultiThread, 61, 61)
+        }
     }
 
     /// Returns a new runtime builder initialized with default configuration
@@ -163,6 +254,11 @@ impl Builder {
             // as parameters.
             global_queue_interval,
             event_interval,
+
+            #[cfg(tokio_unstable)]
+            unhandled_panic: UnhandledPanic::Ignore,
+
+            disable_lifo_slot: false,
         }
     }
 
@@ -183,7 +279,11 @@ impl Builder {
     ///     .unwrap();
     /// ```
     pub fn enable_all(&mut self) -> &mut Self {
-        #[cfg(any(feature = "net", feature = "process", all(unix, feature = "signal")))]
+        #[cfg(any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal")
+        ))]
         self.enable_io();
         #[cfg(feature = "time")]
         self.enable_time();
@@ -200,11 +300,7 @@ impl Builder {
     ///
     /// The default value is the number of cores available to the system.
     ///
-    /// # Panic
-    ///
-    /// When using the `current_thread` runtime this method will panic, since
-    /// those variants do not allow setting worker thread counts.
-    ///
+    /// When using the `current_thread` runtime this method has no effect.
     ///
     /// # Examples
     ///
@@ -237,9 +333,10 @@ impl Builder {
     /// rt.block_on(async move {});
     /// ```
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// This will panic if `val` is not larger than `0`.
+    #[track_caller]
     pub fn worker_threads(&mut self, val: usize) -> &mut Self {
         assert!(val > 0, "Worker threads cannot be set to 0");
         self.worker_threads = Some(val);
@@ -255,7 +352,7 @@ impl Builder {
     ///
     /// The default value is 512.
     ///
-    /// # Panic
+    /// # Panics
     ///
     /// This will panic if `val` is not larger than `0`.
     ///
@@ -267,6 +364,7 @@ impl Builder {
     /// [`spawn_blocking`]: fn@crate::task::spawn_blocking
     /// [`worker_threads`]: Self::worker_threads
     /// [`thread_keep_alive`]: Self::thread_keep_alive
+    #[track_caller]
     #[cfg_attr(docsrs, doc(alias = "max_threads"))]
     pub fn max_blocking_threads(&mut self, val: usize) -> &mut Self {
         assert!(val > 0, "Max blocking threads cannot be set to 0");
@@ -527,8 +625,8 @@ impl Builder {
     /// ```
     pub fn build(&mut self) -> io::Result<Runtime> {
         match &self.kind {
-            Kind::CurrentThread => self.build_basic_runtime(),
-            #[cfg(feature = "rt-multi-thread")]
+            Kind::CurrentThread => self.build_current_thread_runtime(),
+            #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
             Kind::MultiThread => self.build_threaded_runtime(),
         }
     }
@@ -537,7 +635,7 @@ impl Builder {
         driver::Cfg {
             enable_pause_time: match self.kind {
                 Kind::CurrentThread => true,
-                #[cfg(feature = "rt-multi-thread")]
+                #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
                 Kind::MultiThread => false,
             },
             enable_io: self.enable_io,
@@ -631,8 +729,110 @@ impl Builder {
         self
     }
 
-    fn build_basic_runtime(&mut self) -> io::Result<Runtime> {
-        use crate::runtime::{BasicScheduler, HandleInner, Kind};
+    cfg_unstable! {
+        /// Configure how the runtime responds to an unhandled panic on a
+        /// spawned task.
+        ///
+        /// By default, an unhandled panic (i.e. a panic not caught by
+        /// [`std::panic::catch_unwind`]) has no impact on the runtime's
+        /// execution. The panic is error value is forwarded to the task's
+        /// [`JoinHandle`] and all other spawned tasks continue running.
+        ///
+        /// The `unhandled_panic` option enables configuring this behavior.
+        ///
+        /// * `UnhandledPanic::Ignore` is the default behavior. Panics on
+        ///   spawned tasks have no impact on the runtime's execution.
+        /// * `UnhandledPanic::ShutdownRuntime` will force the runtime to
+        ///   shutdown immediately when a spawned task panics even if that
+        ///   task's `JoinHandle` has not been dropped. All other spawned tasks
+        ///   will immediately terminate and further calls to
+        ///   [`Runtime::block_on`] will panic.
+        ///
+        /// # Unstable
+        ///
+        /// This option is currently unstable and its implementation is
+        /// incomplete. The API may change or be removed in the future. See
+        /// tokio-rs/tokio#4516 for more details.
+        ///
+        /// # Examples
+        ///
+        /// The following demonstrates a runtime configured to shutdown on
+        /// panic. The first spawned task panics and results in the runtime
+        /// shutting down. The second spawned task never has a chance to
+        /// execute. The call to `block_on` will panic due to the runtime being
+        /// forcibly shutdown.
+        ///
+        /// ```should_panic
+        /// use tokio::runtime::{self, UnhandledPanic};
+        ///
+        /// # pub fn main() {
+        /// let rt = runtime::Builder::new_current_thread()
+        ///     .unhandled_panic(UnhandledPanic::ShutdownRuntime)
+        ///     .build()
+        ///     .unwrap();
+        ///
+        /// rt.spawn(async { panic!("boom"); });
+        /// rt.spawn(async {
+        ///     // This task never completes.
+        /// });
+        ///
+        /// rt.block_on(async {
+        ///     // Do some work
+        /// # loop { tokio::task::yield_now().await; }
+        /// })
+        /// # }
+        /// ```
+        ///
+        /// [`JoinHandle`]: struct@crate::task::JoinHandle
+        pub fn unhandled_panic(&mut self, behavior: UnhandledPanic) -> &mut Self {
+            self.unhandled_panic = behavior;
+            self
+        }
+
+        /// Disables the LIFO task scheduler heuristic.
+        ///
+        /// The multi-threaded scheduler includes a heuristic for optimizing
+        /// message-passing patterns. This heuristic results in the **last**
+        /// scheduled task being polled first.
+        ///
+        /// To implement this heuristic, each worker thread has a slot which
+        /// holds the task that should be polled next. However, this slot cannot
+        /// be stolen by other worker threads, which can result in lower total
+        /// throughput when tasks tend to have longer poll times.
+        ///
+        /// This configuration option will disable this heuristic resulting in
+        /// all scheduled tasks being pushed into the worker-local queue, which
+        /// is stealable.
+        ///
+        /// Consider trying this option when the task "scheduled" time is high
+        /// but the runtime is underutilized. Use tokio-rs/tokio-metrics to
+        /// collect this data.
+        ///
+        /// # Unstable
+        ///
+        /// This configuration option is considered a workaround for the LIFO
+        /// slot not being stealable. When the slot becomes stealable, we will
+        /// revisit whther or not this option is necessary. See
+        /// tokio-rs/tokio#4941.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime;
+        ///
+        /// let rt = runtime::Builder::new_multi_thread()
+        ///     .disable_lifo_slot()
+        ///     .build()
+        ///     .unwrap();
+        /// ```
+        pub fn disable_lifo_slot(&mut self) -> &mut Self {
+            self.disable_lifo_slot = true;
+            self
+        }
+    }
+
+    fn build_current_thread_runtime(&mut self) -> io::Result<Runtime> {
+        use crate::runtime::{Config, CurrentThread, HandleInner, Kind};
 
         let (driver, resources) = driver::Driver::new(self.get_cfg())?;
 
@@ -652,15 +852,20 @@ impl Builder {
         // there are no futures ready to do something, it'll let the timer or
         // the reactor to generate some new stimuli for the futures to continue
         // in their life.
-        let scheduler = BasicScheduler::new(
+        let scheduler = CurrentThread::new(
             driver,
             handle_inner,
-            self.before_park.clone(),
-            self.after_unpark.clone(),
-            self.global_queue_interval,
-            self.event_interval,
+            Config {
+                before_park: self.before_park.clone(),
+                after_unpark: self.after_unpark.clone(),
+                global_queue_interval: self.global_queue_interval,
+                event_interval: self.event_interval,
+                #[cfg(tokio_unstable)]
+                unhandled_panic: self.unhandled_panic.clone(),
+                disable_lifo_slot: self.disable_lifo_slot,
+            },
         );
-        let spawner = Spawner::Basic(scheduler.spawner().clone());
+        let spawner = Spawner::CurrentThread(scheduler.spawner().clone());
 
         Ok(Runtime {
             kind: Kind::CurrentThread(scheduler),
@@ -746,7 +951,7 @@ cfg_rt_multi_thread! {
     impl Builder {
         fn build_threaded_runtime(&mut self) -> io::Result<Runtime> {
             use crate::loom::sys::num_cpus;
-            use crate::runtime::{HandleInner, Kind, ThreadPool};
+            use crate::runtime::{Config, HandleInner, Kind, MultiThread};
 
             let core_threads = self.worker_threads.unwrap_or_else(num_cpus);
 
@@ -765,16 +970,21 @@ cfg_rt_multi_thread! {
                 blocking_spawner,
             };
 
-            let (scheduler, launch) = ThreadPool::new(
+            let (scheduler, launch) = MultiThread::new(
                 core_threads,
                 driver,
                 handle_inner,
-                self.before_park.clone(),
-                self.after_unpark.clone(),
-                self.global_queue_interval,
-                self.event_interval,
+                Config {
+                    before_park: self.before_park.clone(),
+                    after_unpark: self.after_unpark.clone(),
+                    global_queue_interval: self.global_queue_interval,
+                    event_interval: self.event_interval,
+                    #[cfg(tokio_unstable)]
+                    unhandled_panic: self.unhandled_panic.clone(),
+                    disable_lifo_slot: self.disable_lifo_slot,
+                },
             );
-            let spawner = Spawner::ThreadPool(scheduler.spawner().clone());
+            let spawner = Spawner::MultiThread(scheduler.spawner().clone());
 
             // Create the runtime handle
             let handle = Handle { spawner };
@@ -784,7 +994,7 @@ cfg_rt_multi_thread! {
             launch.launch();
 
             Ok(Runtime {
-                kind: Kind::ThreadPool(scheduler),
+                kind: Kind::MultiThread(scheduler),
                 handle,
                 blocking_pool,
             })

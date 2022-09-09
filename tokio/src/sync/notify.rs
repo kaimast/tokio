@@ -216,7 +216,6 @@ enum NotificationType {
 }
 
 #[derive(Debug)]
-#[repr(C)] // required by `linked_list::Link` impl
 struct Waiter {
     /// Intrusive linked-list pointers.
     pointers: linked_list::Pointers<Waiter>,
@@ -229,6 +228,14 @@ struct Waiter {
 
     /// Should not be `Unpin`.
     _p: PhantomPinned,
+}
+
+generate_addr_of_methods! {
+    impl<> Waiter {
+        unsafe fn addr_of_pointers(self: NonNull<Self>) -> NonNull<linked_list::Pointers<Waiter>> {
+            &self.pointers
+        }
+    }
 }
 
 /// Future returned from [`Notify::notified()`].
@@ -1048,7 +1055,7 @@ unsafe impl linked_list::Link for Waiter {
     }
 
     unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
-        target.cast()
+        Waiter::addr_of_pointers(target)
     }
 }
 

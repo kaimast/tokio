@@ -3,7 +3,7 @@
 use crate::loom::sync::{Arc, Condvar, Mutex};
 use crate::loom::thread;
 use crate::runtime::blocking::schedule::NoopSchedule;
-use crate::runtime::blocking::shutdown;
+use crate::runtime::blocking::{shutdown, BlockingTask};
 use crate::runtime::builder::ThreadNameFn;
 use crate::runtime::context;
 use crate::runtime::task::{self, JoinHandle};
@@ -11,6 +11,7 @@ use crate::runtime::{Builder, Callback, ToHandle};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::io;
 use std::time::Duration;
 
 pub(crate) struct BlockingPool {
@@ -82,6 +83,25 @@ pub(crate) enum Mandatory {
     NonMandatory,
 }
 
+pub(crate) enum SpawnError {
+    /// Pool is shutting down and the task was not scheduled
+    ShuttingDown,
+    /// There are no worker threads available to take the task
+    /// and the OS failed to spawn a new one
+    NoThreads(io::Error),
+}
+
+impl From<SpawnError> for io::Error {
+    fn from(e: SpawnError) -> Self {
+        match e {
+            SpawnError::ShuttingDown => {
+                io::Error::new(io::ErrorKind::Other, "blocking pool shutting down")
+            }
+            SpawnError::NoThreads(e) => e,
+        }
+    }
+}
+
 impl Task {
     pub(crate) fn new(task: task::UnownedTask<NoopSchedule>, mandatory: Mandatory) -> Task {
         Task { task, mandatory }
@@ -105,6 +125,7 @@ const KEEP_ALIVE: Duration = Duration::from_secs(10);
 /// Tasks will be scheduled as non-mandatory, meaning they may not get executed
 /// in case of runtime shutdown.
 #[track_caller]
+#[cfg_attr(tokio_wasi, allow(dead_code))]
 pub(crate) fn spawn_blocking<F, R>(func: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
@@ -129,7 +150,7 @@ cfg_fs! {
         R: Send + 'static,
     {
         let rt = context::current();
-        rt.as_inner().spawn_mandatory_blocking(&rt, func)
+        rt.as_inner().blocking_spawner.spawn_mandatory_blocking(&rt, func)
     }
 }
 
@@ -220,7 +241,103 @@ impl fmt::Debug for BlockingPool {
 // ===== impl Spawner =====
 
 impl Spawner {
-    pub(crate) fn spawn(&self, task: Task, rt: &dyn ToHandle) -> Result<(), ()> {
+    #[track_caller]
+    pub(crate) fn spawn_blocking<F, R>(&self, rt: &dyn ToHandle, func: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (join_handle, spawn_result) =
+            if cfg!(debug_assertions) && std::mem::size_of::<F>() > 2048 {
+                self.spawn_blocking_inner(Box::new(func), Mandatory::NonMandatory, None, rt)
+            } else {
+                self.spawn_blocking_inner(func, Mandatory::NonMandatory, None, rt)
+            };
+
+        match spawn_result {
+            Ok(()) => join_handle,
+            // Compat: do not panic here, return the join_handle even though it will never resolve
+            Err(SpawnError::ShuttingDown) => join_handle,
+            Err(SpawnError::NoThreads(e)) => {
+                panic!("OS can't spawn worker thread: {}", e)
+            }
+        }
+    }
+
+    cfg_fs! {
+        #[track_caller]
+        #[cfg_attr(any(
+            all(loom, not(test)), // the function is covered by loom tests
+            test
+        ), allow(dead_code))]
+        pub(crate) fn spawn_mandatory_blocking<F, R>(&self, rt: &dyn ToHandle, func: F) -> Option<JoinHandle<R>>
+        where
+            F: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            let (join_handle, spawn_result) = if cfg!(debug_assertions) && std::mem::size_of::<F>() > 2048 {
+                self.spawn_blocking_inner(
+                    Box::new(func),
+                    Mandatory::Mandatory,
+                    None,
+                    rt,
+                )
+            } else {
+                self.spawn_blocking_inner(
+                    func,
+                    Mandatory::Mandatory,
+                    None,
+                    rt,
+                )
+            };
+
+            if spawn_result.is_ok() {
+                Some(join_handle)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[track_caller]
+    pub(crate) fn spawn_blocking_inner<F, R>(
+        &self,
+        func: F,
+        is_mandatory: Mandatory,
+        name: Option<&str>,
+        rt: &dyn ToHandle,
+    ) -> (JoinHandle<R>, Result<(), SpawnError>)
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let fut = BlockingTask::new(func);
+        let id = task::Id::next();
+        #[cfg(all(tokio_unstable, feature = "tracing"))]
+        let fut = {
+            use tracing::Instrument;
+            let location = std::panic::Location::caller();
+            let span = tracing::trace_span!(
+                target: "tokio::task::blocking",
+                "runtime.spawn",
+                kind = %"blocking",
+                task.name = %name.unwrap_or_default(),
+                task.id = id.as_u64(),
+                "fn" = %std::any::type_name::<F>(),
+                spawn.location = %format_args!("{}:{}:{}", location.file(), location.line(), location.column()),
+            );
+            fut.instrument(span)
+        };
+
+        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+        let _ = name;
+
+        let (task, handle) = task::unowned(fut, NoopSchedule, id);
+        let spawned = self.spawn_task(Task::new(task, is_mandatory), rt);
+        (handle, spawned)
+    }
+
+    fn spawn_task(&self, task: Task, rt: &dyn ToHandle) -> Result<(), SpawnError> {
         let mut shared = self.inner.shared.lock();
 
         if shared.shutdown {
@@ -230,7 +347,7 @@ impl Spawner {
             task.task.shutdown();
 
             // no need to even push this task; it would never get picked up
-            return Err(());
+            return Err(SpawnError::ShuttingDown);
         }
 
         shared.queue.push_back(task);
@@ -261,7 +378,7 @@ impl Spawner {
                         Err(e) => {
                             // The OS refused to spawn the thread and there is no thread
                             // to pick up the task that has just been pushed to the queue.
-                            panic!("OS can't spawn worker thread: {}", e)
+                            return Err(SpawnError::NoThreads(e));
                         }
                     }
                 }

@@ -32,7 +32,7 @@
 use std::cell::Cell;
 
 thread_local! {
-    static CURRENT: Cell<Budget> = Cell::new(Budget::unconstrained());
+    static CURRENT: Cell<Budget> = const { Cell::new(Budget::unconstrained()) };
 }
 
 /// Opaque type tracking the amount of "work" a task may still do before
@@ -207,7 +207,7 @@ cfg_coop! {
 mod test {
     use super::*;
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(tokio_wasm_not_wasi)]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn get() -> Budget {
@@ -215,7 +215,7 @@ mod test {
     }
 
     #[test]
-    fn bugeting() {
+    fn budgeting() {
         use futures::future::poll_fn;
         use tokio_test::*;
 
