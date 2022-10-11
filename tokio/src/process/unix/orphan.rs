@@ -43,10 +43,21 @@ pub(crate) struct OrphanQueueImpl<T> {
 }
 
 impl<T> OrphanQueueImpl<T> {
-    pub(crate) fn new() -> Self {
-        Self {
-            sigchild: Mutex::new(None),
-            queue: Mutex::new(Vec::new()),
+    cfg_not_has_const_mutex_new! {
+        pub(crate) fn new() -> Self {
+            Self {
+                sigchild: Mutex::new(None),
+                queue: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    cfg_has_const_mutex_new! {
+        pub(crate) const fn new() -> Self {
+            Self {
+                sigchild: Mutex::const_new(None),
+                queue: Mutex::const_new(Vec::new()),
+            }
         }
     }
 
@@ -120,7 +131,7 @@ where
 #[cfg(all(test, not(loom)))]
 pub(crate) mod test {
     use super::*;
-    use crate::io::driver::Driver as IoDriver;
+    use crate::runtime::io::Driver as IoDriver;
     use crate::signal::unix::driver::{Driver as SignalDriver, Handle as SignalHandle};
     use crate::sync::watch;
     use std::cell::{Cell, RefCell};

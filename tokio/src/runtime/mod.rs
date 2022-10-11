@@ -137,7 +137,7 @@
 //! use tokio::runtime;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let basic_rt = runtime::Builder::new_current_thread()
+//! let rt = runtime::Builder::new_current_thread()
 //!     .build()?;
 //! # Ok(()) }
 //! ```
@@ -166,7 +166,6 @@
 //! [`tokio::main`]: ../attr.main.html
 //! [runtime builder]: crate::runtime::Builder
 //! [`Runtime::new`]: crate::runtime::Runtime::new
-//! [`Builder::basic_scheduler`]: crate::runtime::Builder::basic_scheduler
 //! [`Builder::threaded_scheduler`]: crate::runtime::Builder::threaded_scheduler
 //! [`Builder::enable_io`]: crate::runtime::Builder::enable_io
 //! [`Builder::enable_time`]: crate::runtime::Builder::enable_time
@@ -174,36 +173,34 @@
 
 // At the top due to macros
 #[cfg(test)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(tokio_wasm))]
 #[macro_use]
 mod tests;
 
-pub(crate) mod enter;
+mod driver;
+pub(crate) mod scheduler;
 
-pub(crate) mod task;
-
-cfg_metrics! {
-    mod metrics;
-    pub use metrics::RuntimeMetrics;
-
-    pub(crate) use metrics::{MetricsBatch, SchedulerMetrics, WorkerMetrics};
-
-    cfg_net! {
-       pub(crate) use metrics::IoDriverMetrics;
-    }
+cfg_io_driver_impl! {
+    pub(crate) mod io;
 }
 
-cfg_not_metrics! {
-    pub(crate) mod metrics;
-    pub(crate) use metrics::{SchedulerMetrics, WorkerMetrics, MetricsBatch};
+cfg_time! {
+    pub(crate) mod time;
 }
 
 cfg_rt! {
-    mod basic_scheduler;
-    use basic_scheduler::BasicScheduler;
+    pub(crate) mod enter;
+
+    pub(crate) mod task;
+
+    use scheduler::CurrentThread;
+
+    mod config;
+    use config::Config;
 
     mod blocking;
     use blocking::BlockingPool;
+    #[cfg_attr(tokio_wasi, allow(unused_imports))]
     pub(crate) use blocking::spawn_blocking;
 
     cfg_trace! {
@@ -218,26 +215,37 @@ cfg_rt! {
     pub use self::builder::Builder;
     cfg_unstable! {
         pub use self::builder::UnhandledPanic;
+        pub use crate::util::RngSeed;
     }
 
     pub(crate) mod context;
-    mod driver;
 
     use self::enter::enter;
 
     mod handle;
     pub use handle::{EnterGuard, Handle, TryCurrentError};
-    pub(crate) use handle::{HandleInner, ToHandle};
 
-    mod spawner;
-    use self::spawner::Spawner;
+    cfg_metrics! {
+        mod metrics;
+        pub use metrics::RuntimeMetrics;
+
+        pub(crate) use metrics::{MetricsBatch, SchedulerMetrics, WorkerMetrics};
+
+        cfg_net! {
+        pub(crate) use metrics::IoDriverMetrics;
+        }
+    }
+
+    cfg_not_metrics! {
+        pub(crate) mod metrics;
+        pub(crate) use metrics::{SchedulerMetrics, WorkerMetrics, MetricsBatch};
+    }
 }
 
 cfg_rt_multi_thread! {
     use driver::Driver;
 
-    pub(crate) mod thread_pool;
-    use self::thread_pool::ThreadPool;
+    use scheduler::MultiThread;
 }
 
 cfg_rt! {
@@ -286,8 +294,8 @@ cfg_rt! {
     /// [`Builder`]: struct@Builder
     #[derive(Debug)]
     pub struct Runtime {
-        /// Task executor
-        kind: Kind,
+        /// Task scheduler
+        scheduler: Scheduler,
 
         /// Handle to runtime, also contains driver handles
         handle: Handle,
@@ -296,54 +304,55 @@ cfg_rt! {
         blocking_pool: BlockingPool,
     }
 
-    /// The runtime executor is either a thread-pool or a current-thread executor.
+    /// The runtime scheduler is either a multi-thread or a current-thread executor.
     #[derive(Debug)]
-    enum Kind {
+    enum Scheduler {
         /// Execute all tasks on the current-thread.
-        CurrentThread(BasicScheduler),
+        CurrentThread(CurrentThread),
 
         /// Execute tasks across multiple threads.
-        #[cfg(feature = "rt-multi-thread")]
-        ThreadPool(ThreadPool),
+        #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+        MultiThread(MultiThread),
     }
 
     /// After thread starts / before thread stops
     type Callback = std::sync::Arc<dyn Fn() + Send + Sync>;
 
     impl Runtime {
-        /// Creates a new runtime instance with default configuration values.
-        ///
-        /// This results in the multi threaded scheduler, I/O driver, and time driver being
-        /// initialized.
-        ///
-        /// Most applications will not need to call this function directly. Instead,
-        /// they will use the  [`#[tokio::main]` attribute][main]. When a more complex
-        /// configuration is necessary, the [runtime builder] may be used.
-        ///
-        /// See [module level][mod] documentation for more details.
-        ///
-        /// # Examples
-        ///
-        /// Creating a new `Runtime` with default configuration values.
-        ///
-        /// ```
-        /// use tokio::runtime::Runtime;
-        ///
-        /// let rt = Runtime::new()
-        ///     .unwrap();
-        ///
-        /// // Use the runtime...
-        /// ```
-        ///
-        /// [mod]: index.html
-        /// [main]: ../attr.main.html
-        /// [threaded scheduler]: index.html#threaded-scheduler
-        /// [basic scheduler]: index.html#basic-scheduler
-        /// [runtime builder]: crate::runtime::Builder
-        #[cfg(feature = "rt-multi-thread")]
-        #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
-        pub fn new() -> std::io::Result<Runtime> {
-            Builder::new_multi_thread().enable_all().build()
+        cfg_not_wasi! {
+            /// Creates a new runtime instance with default configuration values.
+            ///
+            /// This results in the multi threaded scheduler, I/O driver, and time driver being
+            /// initialized.
+            ///
+            /// Most applications will not need to call this function directly. Instead,
+            /// they will use the  [`#[tokio::main]` attribute][main]. When a more complex
+            /// configuration is necessary, the [runtime builder] may be used.
+            ///
+            /// See [module level][mod] documentation for more details.
+            ///
+            /// # Examples
+            ///
+            /// Creating a new `Runtime` with default configuration values.
+            ///
+            /// ```
+            /// use tokio::runtime::Runtime;
+            ///
+            /// let rt = Runtime::new()
+            ///     .unwrap();
+            ///
+            /// // Use the runtime...
+            /// ```
+            ///
+            /// [mod]: index.html
+            /// [main]: ../attr.main.html
+            /// [threaded scheduler]: index.html#threaded-scheduler
+            /// [runtime builder]: crate::runtime::Builder
+            #[cfg(feature = "rt-multi-thread")]
+            #[cfg_attr(docsrs, doc(cfg(feature = "rt-multi-thread")))]
+            pub fn new() -> std::io::Result<Runtime> {
+                Builder::new_multi_thread().enable_all().build()
+            }
         }
 
         /// Returns a handle to the runtime's spawner.
@@ -472,16 +481,17 @@ cfg_rt! {
         /// ```
         ///
         /// [handle]: fn@Handle::block_on
+        #[track_caller]
         pub fn block_on<F: Future>(&self, future: F) -> F::Output {
             #[cfg(all(tokio_unstable, feature = "tracing"))]
             let future = crate::util::trace::task(future, "block_on", None, task::Id::next().as_u64());
 
             let _enter = self.enter();
 
-            match &self.kind {
-                Kind::CurrentThread(exec) => exec.block_on(future),
-                #[cfg(feature = "rt-multi-thread")]
-                Kind::ThreadPool(exec) => exec.block_on(future),
+            match &self.scheduler {
+                Scheduler::CurrentThread(exec) => exec.block_on(future),
+                #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+                Scheduler::MultiThread(exec) => exec.block_on(future),
             }
         }
 
@@ -558,7 +568,7 @@ cfg_rt! {
         /// ```
         pub fn shutdown_timeout(mut self, duration: Duration) {
             // Wakeup and shutdown all the worker threads
-            self.handle.clone().shutdown();
+            self.handle.inner.shutdown();
             self.blocking_pool.shutdown(Some(duration));
         }
 
@@ -573,7 +583,7 @@ cfg_rt! {
         /// may result in a resource leak (in that any blocking tasks are still running until they
         /// return.
         ///
-        /// This function is equivalent to calling `shutdown_timeout(Duration::of_nanos(0))`.
+        /// This function is equivalent to calling `shutdown_timeout(Duration::from_nanos(0))`.
         ///
         /// ```
         /// use tokio::runtime::Runtime;
@@ -596,12 +606,12 @@ cfg_rt! {
     #[allow(clippy::single_match)] // there are comments in the error branch, so we don't want if-let
     impl Drop for Runtime {
         fn drop(&mut self) {
-            match &mut self.kind {
-                Kind::CurrentThread(basic) => {
-                    // This ensures that tasks spawned on the basic runtime are dropped inside the
-                    // runtime's context.
+            match &mut self.scheduler {
+                Scheduler::CurrentThread(current_thread) => {
+                    // This ensures that tasks spawned on the current-thread
+                    // runtime are dropped inside the runtime's context.
                     match self::context::try_enter(self.handle.clone()) {
-                        Some(guard) => basic.set_context_guard(guard),
+                        Some(guard) => current_thread.set_context_guard(guard),
                         None => {
                             // The context thread-local has already been destroyed.
                             //
@@ -610,8 +620,8 @@ cfg_rt! {
                         },
                     }
                 },
-                #[cfg(feature = "rt-multi-thread")]
-                Kind::ThreadPool(_) => {
+                #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+                Scheduler::MultiThread(_) => {
                     // The threaded scheduler drops its tasks on its worker threads, which is
                     // already in the runtime's context.
                 },

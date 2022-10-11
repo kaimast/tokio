@@ -155,11 +155,11 @@ cfg_rt_multi_thread! {
     pub(super) use self::inject::Inject;
 }
 
-#[cfg(all(feature = "rt", any(tokio_unstable, test)))]
+#[cfg(feature = "rt")]
 mod abort;
 mod join;
 
-#[cfg(all(feature = "rt", any(tokio_unstable, test)))]
+#[cfg(feature = "rt")]
 #[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
 pub use self::abort::AbortHandle;
 
@@ -334,6 +334,10 @@ impl<S: 'static> Task<S> {
     fn header(&self) -> &Header {
         self.raw.header()
     }
+
+    fn header_ptr(&self) -> NonNull<Header> {
+        self.raw.header_ptr()
+    }
 }
 
 impl<S: 'static> Notified<S> {
@@ -365,7 +369,7 @@ cfg_rt_multi_thread! {
 }
 
 impl<S: Schedule> Task<S> {
-    /// Pre-emptively cancels the task as part of the shutdown process.
+    /// Preemptively cancels the task as part of the shutdown process.
     pub(crate) fn shutdown(self) {
         let raw = self.raw;
         mem::forget(self);
@@ -385,7 +389,7 @@ impl<S: Schedule> LocalNotified<S> {
 impl<S: Schedule> UnownedTask<S> {
     // Used in test of the inject queue.
     #[cfg(test)]
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    #[cfg_attr(tokio_wasm, allow(dead_code))]
     pub(super) fn into_notified(self) -> Notified<S> {
         Notified(self.into_task())
     }
@@ -473,8 +477,7 @@ unsafe impl<S> linked_list::Link for Task<S> {
     }
 
     unsafe fn pointers(target: NonNull<Header>) -> NonNull<linked_list::Pointers<Header>> {
-        // Not super great as it avoids some of looms checking...
-        NonNull::from(target.as_ref().owned.with_mut(|ptr| &mut *ptr))
+        self::core::Trailer::addr_of_owned(Header::get_trailer(target))
     }
 }
 
@@ -504,15 +507,35 @@ impl Id {
     }
 
     cfg_not_has_atomic_u64! {
-        pub(crate) fn next() -> Self {
-            use once_cell::sync::Lazy;
-            use crate::loom::sync::Mutex;
+        cfg_has_const_mutex_new! {
+            pub(crate) fn next() -> Self {
+                use crate::loom::sync::Mutex;
+                static NEXT_ID: Mutex<u64> = Mutex::const_new(1);
 
-            static NEXT_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(1));
-            let mut lock = NEXT_ID.lock();
-            let id = *lock;
-            *lock += 1;
-            Self(id)
+                let mut lock = NEXT_ID.lock();
+                let id = *lock;
+                *lock += 1;
+                Self(id)
+            }
+        }
+
+        cfg_not_has_const_mutex_new! {
+            pub(crate) fn next() -> Self {
+                use crate::util::once_cell::OnceCell;
+                use crate::loom::sync::Mutex;
+
+                fn init_next_id() -> Mutex<u64> {
+                    Mutex::new(1)
+                }
+
+                static NEXT_ID: OnceCell<Mutex<u64>> = OnceCell::new();
+
+                let next_id = NEXT_ID.get(init_next_id);
+                let mut lock = next_id.lock();
+                let id = *lock;
+                *lock += 1;
+                Self(id)
+            }
         }
     }
 

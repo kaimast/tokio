@@ -1,10 +1,10 @@
 #![cfg(feature = "macros")]
 #![allow(clippy::blacklisted_name)]
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(tokio_wasm_not_wasi)]
 use wasm_bindgen_test::wasm_bindgen_test as maybe_tokio_test;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(tokio_wasm_not_wasi))]
 use tokio::test as maybe_tokio_test;
 
 use tokio::sync::oneshot;
@@ -598,4 +598,67 @@ async fn mut_ref_patterns() {
             assert_eq!(*foo, "2");
         },
     };
+}
+
+#[cfg(tokio_unstable)]
+mod unstable {
+    use tokio::runtime::RngSeed;
+
+    #[test]
+    fn deterministic_select_current_thread() {
+        let seed = b"bytes used to generate seed";
+        let rt1 = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(RngSeed::from_bytes(seed))
+            .build()
+            .unwrap();
+        let rt1_values = rt1.block_on(async { (select_0_to_9().await, select_0_to_9().await) });
+
+        let rt2 = tokio::runtime::Builder::new_current_thread()
+            .rng_seed(RngSeed::from_bytes(seed))
+            .build()
+            .unwrap();
+        let rt2_values = rt2.block_on(async { (select_0_to_9().await, select_0_to_9().await) });
+
+        assert_eq!(rt1_values, rt2_values);
+    }
+
+    #[test]
+    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+    fn deterministic_select_multi_thread() {
+        let seed = b"bytes used to generate seed";
+        let rt1 = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .rng_seed(RngSeed::from_bytes(seed))
+            .build()
+            .unwrap();
+        let rt1_values = rt1.block_on(async {
+            let _ = tokio::spawn(async { (select_0_to_9().await, select_0_to_9().await) }).await;
+        });
+
+        let rt2 = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .rng_seed(RngSeed::from_bytes(seed))
+            .build()
+            .unwrap();
+        let rt2_values = rt2.block_on(async {
+            let _ = tokio::spawn(async { (select_0_to_9().await, select_0_to_9().await) }).await;
+        });
+
+        assert_eq!(rt1_values, rt2_values);
+    }
+
+    async fn select_0_to_9() -> u32 {
+        tokio::select!(
+            x = async { 0 } => x,
+            x = async { 1 } => x,
+            x = async { 2 } => x,
+            x = async { 3 } => x,
+            x = async { 4 } => x,
+            x = async { 5 } => x,
+            x = async { 6 } => x,
+            x = async { 7 } => x,
+            x = async { 8 } => x,
+            x = async { 9 } => x,
+        )
+    }
 }
