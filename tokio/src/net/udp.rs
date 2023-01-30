@@ -179,13 +179,20 @@ impl UdpSocket {
     /// Creates new `UdpSocket` from a previously bound `std::net::UdpSocket`.
     ///
     /// This function is intended to be used to wrap a UDP socket from the
-    /// standard library in the Tokio equivalent. The conversion assumes nothing
-    /// about the underlying socket; it is left up to the user to set it in
-    /// non-blocking mode.
+    /// standard library in the Tokio equivalent.
     ///
     /// This can be used in conjunction with socket2's `Socket` interface to
     /// configure a socket before it's handed off, such as setting options like
     /// `reuse_address` or binding to multiple addresses.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the socket is in
+    /// non-blocking mode. Otherwise all I/O operations on the socket
+    /// will block the thread, which will cause unexpected behavior.
+    /// Non-blocking mode can be set using [`set_nonblocking`].
+    ///
+    /// [`set_nonblocking`]: std::net::UdpSocket::set_nonblocking
     ///
     /// # Panics
     ///
@@ -357,7 +364,9 @@ impl UdpSocket {
     ///
     /// The function may complete without the socket being ready. This is a
     /// false-positive and attempting an operation will return with
-    /// `io::ErrorKind::WouldBlock`.
+    /// `io::ErrorKind::WouldBlock`. The function can also return with an empty
+    /// [`Ready`] set, so you should always check the returned value and possibly
+    /// wait again if the requested states are not set.
     ///
     /// # Cancel safety
     ///
@@ -740,7 +749,7 @@ impl UdpSocket {
     ///
     /// # Cancel safety
     ///
-    /// This method is cancel safe. If `recv_from` is used as the event in a
+    /// This method is cancel safe. If `recv` is used as the event in a
     /// [`tokio::select!`](crate::select) statement and some other branch
     /// completes first, it is guaranteed that no messages were received on this
     /// socket.
@@ -925,7 +934,7 @@ impl UdpSocket {
 
                 // Safety: We trust `UdpSocket::recv` to have filled up `n` bytes in the
                 // buffer.
-                let n = (&*self.io).recv(dst)?;
+                let n = (*self.io).recv(dst)?;
 
                 unsafe {
                     buf.advance_mut(n);
@@ -989,7 +998,7 @@ impl UdpSocket {
 
                 // Safety: We trust `UdpSocket::recv_from` to have filled up `n` bytes in the
                 // buffer.
-                let (n, addr) = (&*self.io).recv_from(dst)?;
+                let (n, addr) = (*self.io).recv_from(dst)?;
 
                 unsafe {
                     buf.advance_mut(n);
@@ -1271,7 +1280,7 @@ impl UdpSocket {
     /// Tries to read or write from the socket using a user-provided IO operation.
     ///
     /// If the socket is ready, the provided closure is called. The closure
-    /// should attempt to perform IO operation from the socket by manually
+    /// should attempt to perform IO operation on the socket by manually
     /// calling the appropriate syscall. If the operation fails because the
     /// socket is not actually ready, then the closure should return a
     /// `WouldBlock` error and the readiness flag is cleared. The return value
@@ -1289,6 +1298,11 @@ impl UdpSocket {
     /// The closure should not perform the IO operation using any of the methods
     /// defined on the Tokio `UdpSocket` type, as this will mess with the
     /// readiness flag and can cause the socket to behave incorrectly.
+    ///
+    /// This method is not intended to be used with combined interests.
+    /// The closure should perform only one type of IO operation, so it should not
+    /// require more than one ready state. This method may panic or sleep forever
+    /// if it is called with a combined interest.
     ///
     /// Usually, [`readable()`], [`writable()`] or [`ready()`] is used with this function.
     ///

@@ -120,6 +120,10 @@ impl<T: 'static> JoinSet<T> {
     /// Spawn the provided task on the `JoinSet`, returning an [`AbortHandle`]
     /// that can be used to remotely cancel the task.
     ///
+    /// The provided future will start running in the background immediately
+    /// when this method is called, even if you don't await anything on this
+    /// `JoinSet`.
+    ///
     /// # Panics
     ///
     /// This method panics if called outside of a Tokio runtime.
@@ -139,6 +143,10 @@ impl<T: 'static> JoinSet<T> {
     /// `JoinSet` returning an [`AbortHandle`] that can be used to remotely
     /// cancel the task.
     ///
+    /// The provided future will start running in the background immediately
+    /// when this method is called, even if you don't await anything on this
+    /// `JoinSet`.
+    ///
     /// [`AbortHandle`]: crate::task::AbortHandle
     #[track_caller]
     pub fn spawn_on<F>(&mut self, task: F, handle: &Handle) -> AbortHandle
@@ -153,6 +161,10 @@ impl<T: 'static> JoinSet<T> {
     /// Spawn the provided task on the current [`LocalSet`] and store it in this
     /// `JoinSet`, returning an [`AbortHandle`] that can be used to remotely
     /// cancel the task.
+    ///
+    /// The provided future will start running in the background immediately
+    /// when this method is called, even if you don't await anything on this
+    /// `JoinSet`.
     ///
     /// # Panics
     ///
@@ -173,8 +185,13 @@ impl<T: 'static> JoinSet<T> {
     /// this `JoinSet`, returning an [`AbortHandle`] that can be used to
     /// remotely cancel the task.
     ///
+    /// Unlike the [`spawn_local`] method, this method may be used to spawn local
+    /// tasks on a `LocalSet` that is _not_ currently running. The provided
+    /// future will start running whenever the `LocalSet` is next started.
+    ///
     /// [`LocalSet`]: crate::task::LocalSet
     /// [`AbortHandle`]: crate::task::AbortHandle
+    /// [`spawn_local`]: Self::spawn_local
     #[track_caller]
     pub fn spawn_local_on<F>(&mut self, task: F, local_set: &LocalSet) -> AbortHandle
     where
